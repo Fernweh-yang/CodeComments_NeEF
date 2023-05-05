@@ -74,25 +74,36 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   **kwargs):
     """Render rays
     Args:
-      H: int. Height of image in pixels.
-      W: int. Width of image in pixels.
-      focal: float. Focal length of pinhole camera.
-      chunk: int. Maximum number of rays to process simultaneously. Used to
+      H 图像高度: int. Height of image in pixels. 
+
+      W 图像宽度: int. Width of image in pixels.  
+
+      focal 针孔相机焦距: float. Focal length of pinhole camera. 
+
+      chunk 同步处理的最多光线数: int. Maximum number of rays to process simultaneously. Used to
         control maximum memory usage. Does not affect final results.
-      rays: array of shape [2, batch_size, 3]. Ray origin and direction for
+
+      rays 每个batch的ray的原点和方向: array of shape [2, batch_size, 3]. Ray origin and direction for
         each example in batch.
-      c2w: array of shape [3, 4]. Camera-to-world transformation matrix.
-      ndc: bool. If True, represent ray origin, direction in NDC coordinates.
-      near: float or array of shape [batch_size]. Nearest distance for a ray.
-      far: float or array of shape [batch_size]. Farthest distance for a ray.
-      use_viewdirs: bool. If True, use viewing direction of a point in space in model.
-      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for 
+
+      c2w 相机到世界坐标系的旋转矩阵: array of shape [3, 4]. Camera-to-world transformation matrix.
+
+      ndc NDC坐标: bool. If True, represent ray origin, direction in NDC coordinates.
+
+      near 光线最近距离: float or array of shape [batch_size]. Nearest distance for a ray.
+      
+      far 光线最远距离: float or array of shape [batch_size]. Farthest distance for a ray.
+      
+      use_viewdirs 是否使用方向信息: bool. If True, use viewing direction of a point in space in model.
+      
+      c2w_staticcam 变换矩阵: array of shape [3, 4]. If not None, use this transformation matrix for 
        camera while using other c2w argument for viewing directions.
+   
     Returns:
-      rgb_map: [batch_size, 3]. Predicted RGB values for rays.
-      disp_map: [batch_size]. Disparity map. Inverse of depth.
-      acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
-      extras: dict with everything returned by render_rays().
+      rgb_map: [batch_size, 3]. Predicted RGB values for rays. 预测的rgb图
+      disp_map: [batch_size]. Disparity map. Inverse of depth. 视差图
+      acc_map: [batch_size]. Accumulated opacity (alpha) along a ray. 深度图
+      extras: dict with everything returned by render_rays(). 其他
     """
     if c2w is not None:
         # special case to render full image
@@ -727,16 +738,19 @@ def train():
 
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    
+    # 迭代计算20万次
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
 
         # Sample random ray batch
         if use_batching:
+            # 每次从所有图像的Ray中抽取N_rand个ray，每遍历一边就打乱顺序，然后作为训练数据
             # Random over all images
+            # 这里的3x3指的是：rgb值，光线起始点，光线方向
             batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            batch = torch.transpose(batch, 0, 1)
+            batch = torch.transpose(batch, 0, 1)    #[3,B,3]
+            # 光线起始点和方向：batch_rays =[2,B,3] 光线rgb值：target_s=[B,3]
             batch_rays, target_s = batch[:2], batch[2]
 
             i_batch += N_rand
@@ -745,9 +759,10 @@ def train():
                 rand_idx = torch.randperm(rays_rgb.shape[0])
                 rays_rgb = rays_rgb[rand_idx]
                 i_batch = 0
-
+        #不推荐使用不使用Batch来训练
         else:
             # Random from one image
+            # 每次随机抽取一张图像，抽取一个batch的ray作为训练数据
             img_i = np.random.choice(i_train)
             target = images[img_i]
             target = torch.Tensor(target).to(device)
@@ -778,6 +793,7 @@ def train():
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
+        # ******************* 5.渲染过程*******************
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
