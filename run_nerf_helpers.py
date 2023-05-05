@@ -11,7 +11,7 @@ mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
 
-# Positional encoding (section 5.1)
+# Positional encoding (论文参考5.1的公式4)
 class Embedder:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -24,7 +24,8 @@ class Embedder:
         if self.kwargs['include_input']:
             embed_fns.append(lambda x : x)
             out_dim += d
-            
+        
+        # 位置编码的最大频率是配置config里传过来的
         max_freq = self.kwargs['max_freq_log2']
         N_freqs = self.kwargs['num_freqs']
         
@@ -34,6 +35,7 @@ class Embedder:
             freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
             
         for freq in freq_bands:
+            # periodic_fns用到的函数从下面get_embedder()方法可见，传进来的是sin和cos
             for p_fn in self.kwargs['periodic_fns']:
                 embed_fns.append(lambda x, p_fn=p_fn, freq=freq : p_fn(x * freq))
                 out_dim += d
@@ -55,7 +57,7 @@ def get_embedder(multires, i=0):
                 'max_freq_log2' : multires-1,
                 'num_freqs' : multires,
                 'log_sampling' : True,
-                'periodic_fns' : [torch.sin, torch.cos],
+                'periodic_fns' : [torch.sin, torch.cos],    #用到的函数是sin和cos
     }
     
     embedder_obj = Embedder(**embed_kwargs)
@@ -69,23 +71,24 @@ class NeRF(nn.Module):
         """ 
         """
         super(NeRF, self).__init__()
-        self.D = D
-        self.W = W
-        self.input_ch = input_ch
-        self.input_ch_views = input_ch_views
-        self.skips = skips
-        self.use_viewdirs = use_viewdirs
-        
+        self.D = D  #网络深度
+        self.W = W  #每层设置的通道数
+        self.input_ch = input_ch    #xyz的通道数，位置编码后就是63
+        self.input_ch_views = input_ch_views #方向的通道数，位置编码后是27
+        self.skips = skips #再次加入xyz高维信息的位置，第五层
+        self.use_viewdirs = use_viewdirs #是否使用视角view信息（即方向）
+        # 生成D=8层神经网络，在skip第五层再加入一遍xyz位置信息
         self.pts_linears = nn.ModuleList(
             [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
+        # 对view方向处理的网络层，用1层128通道的网络
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
 
         ### Implementation according to the paper
         # self.views_linears = nn.ModuleList(
         #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
-        
+        # 输出特征层，不透明度（不应该叫sigama吗？）和rgb
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
             self.alpha_linear = nn.Linear(W, 1)
@@ -163,12 +166,18 @@ def get_rays(H, W, K, c2w):
 
 
 def get_rays_np(H, W, K, c2w):
+    # 给图片每个像素都设置一个下标i代表行x 和 j代表列Y
     i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
+    # 1.得到当前像素在相机坐标系下的坐标：2D点到3D点计算公式[x,y,z]=[(u-cx)/fx,-(v-cy)/fx,-1]   见cv笔记内参矩阵拿一块
+    # 该公式在y和z位置均乘-1，原因是nerf使用的坐标系是x轴向右，y轴向上，z轴向外
     dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
+    # 2.将ray方向从相机坐标转到世界坐标系下，即乘了个旋转矩阵
+    # 那个像素和相机原点cx,cy连线就是这个ray，方向是原点指向这个像素
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
-    rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
+    # 相机原点在世界坐标系的坐标，也是同一个相机所有ray的起点
+    rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d)) #[h,w,3]
     return rays_o, rays_d
 
 

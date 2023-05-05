@@ -34,20 +34,21 @@ def batchify(fn, chunk):
         return torch.cat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
     return ret
 
-
+# 实现小批量处理数据
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
+    embedded = embed_fn(inputs_flat)   
 
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
         embedded = torch.cat([embedded, embedded_dirs], -1)
-
+    # 以更小的patch-netchunk送进网络跑前向，比如chunk=20，就1-20跑一波，21-40跑一波。。。
     outputs_flat = batchify(fn, netchunk)(embedded)
+    # 将list重新拼接reshape为[1024,64,64] 4:rgb alpha
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
@@ -179,32 +180,39 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    # ******************* 3.1 位置编码 *******************
+    # x,y,z进行位置编码。输入是xyz三维，输出是input_ch=63维的高维空间。embed_fn就是这个转高维怎么算的一个方法
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
-
+    # 下面是给方向进行位置编码
     input_ch_views = 0
     embeddirs_fn = None
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
-    output_ch = 5 if args.N_importance > 0 else 4
+    output_ch = 5 if args.N_importance > 0 else 4 # 输出通道数，如果有设置fine在光线上额外采样就是5通道，否则4通道
     skips = [4]
+    # ******************* 3.2 NeRF模型初始化 *******************
+    # coarse网络初始化
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
-    grad_vars = list(model.parameters())
+    grad_vars = list(model.parameters()) #取模型参数
 
     model_fine = None
+    # fine网络初始化，就深度和通道数和coarse网络可以不一样
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
-
+    
+    # ******************* 3.3 模型批量处理数据函数 *******************
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
                                                                 netchunk=args.netchunk)
 
-    # Create optimizer
+    # ******************* 3.4 优化器定义 *******************
+    # 使用的adam自适应矩估计优化算法
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
 
     start = 0
@@ -214,6 +222,7 @@ def create_nerf(args):
     ##########################
 
     # Load checkpoints
+    # 加载已有模型参数（如果训练中断了，就可以在原有基础上继续训练）
     if args.ft_path is not None and args.ft_path!='None':
         ckpts = [args.ft_path]
     else:
@@ -234,7 +243,7 @@ def create_nerf(args):
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
     ##########################
-
+    # 训练需要的参数
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
         'perturb' : args.perturb,
@@ -254,7 +263,7 @@ def create_nerf(args):
         render_kwargs_train['lindisp'] = args.lindisp
 
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
-    render_kwargs_test['perturb'] = False
+    render_kwargs_test['perturb'] = False   # 木有扰动
     render_kwargs_test['raw_noise_std'] = 0.
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
@@ -462,7 +471,7 @@ def config_parser():
     parser.add_argument("--N_samples", type=int, default=64, 
                         help='number of coarse samples per ray')#粗糙网络每条光线采样的点数
     parser.add_argument("--N_importance", type=int, default=0,
-                        help='number of additional fine samples per ray')#fine网络每条光线增加的采样点
+                        help='number of additional fine samples per ray')#fine网络每条光线额外的采样点
     parser.add_argument("--perturb", type=float, default=1.,
                         help='set to 0. for no jitter, 1. for jitter')#是否有抖动
     parser.add_argument("--use_viewdirs", action='store_true', 
@@ -643,10 +652,11 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
-    # Create nerf model
+    # ******************* 3.网络构建 *******************
+    # 模型构建：得到训练参数，测试参数，起始step和优化器
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
-
+    # 添加最近最远深度
     bds_dict = {
         'near' : near,
         'far' : far,
@@ -658,6 +668,7 @@ def train():
     render_poses = torch.Tensor(render_poses).to(device)
 
     # Short circuit if only rendering out from trained model
+    # 仅渲染：就只调用渲染函数
     if args.render_only:
         print('RENDER ONLY')
         with torch.no_grad():
@@ -678,20 +689,23 @@ def train():
 
             return
 
+    # ******************* 4.构建raybatch tensor,生成光线数据 *******************
     # Prepare raybatch tensor if batching random rays
-    N_rand = args.N_rand
+    # 如果批量处理光线ray，就准备raybatch tensor
+    N_rand = args.N_rand    # 如果有批处理就从一批照片中随机取imageN*N_rand个光束送入网络进行训练，否则就只从一张图片中选N_rand个光束
     use_batching = not args.no_batching
     if use_batching:
         # For random ray batching
         print('get rays')
         rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
         print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
+        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3] eg.[20,3,378,504,3]
         rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
+        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only取出训练集 eg.[20,378,504,3,3]
         rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
+        # 打乱所有光线排布，或称洗牌 使其不按原来的顺序存储，这样训练更有鲁棒性
         np.random.shuffle(rays_rgb)
 
         print('done')
@@ -707,9 +721,9 @@ def train():
 
     N_iters = 200000 + 1
     print('Begin')
-    print('TRAIN views are', i_train)
-    print('TEST views are', i_test)
-    print('VAL views are', i_val)
+    print('TRAIN views are', i_train)   # 训练图像id
+    print('TEST views are', i_test)     # 测试图像id
+    print('VAL views are', i_val)       # 验证图像id
 
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
