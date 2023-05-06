@@ -97,25 +97,27 @@ class NeRF(nn.Module):
             self.output_linear = nn.Linear(W, output_ch)
 
     def forward(self, x):
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
+        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)   # 将xyz和方向views分开
         h = input_pts
+        # 进入全连接网络
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
             h = F.relu(h)
+            # 在第五层再加一遍输入xyz
             if i in self.skips:
                 h = torch.cat([input_pts, h], -1)
-
+        
         if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
-            feature = self.feature_linear(h)
+            alpha = self.alpha_linear(h)    # 8层全连接网络算完后得到不透明度alpha(sigama)
+            feature = self.feature_linear(h)    # 8层全连接网络算完后得到256维的特征向量
             h = torch.cat([feature, input_views], -1)
         
             for i, l in enumerate(self.views_linears):
                 h = self.views_linears[i](h)
                 h = F.relu(h)
 
-            rgb = self.rgb_linear(h)
-            outputs = torch.cat([rgb, alpha], -1)
+            rgb = self.rgb_linear(h)   #用一层128通道的网络，结合27维的方向和256维的特征向量，计算得到RGB值
+            outputs = torch.cat([rgb, alpha], -1)   # 将计算得到的不透明度alpha 和 颜色RGB 拼接起来
         else:
             outputs = self.output_linear(h)
 
@@ -202,8 +204,11 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 
 # Hierarchical sampling (section 5.2)
+# 第一步：根据pdf概率密度函数，计算累积分布函数CDF
+# 第二步：在[0,1]内，对CDF值用均匀分布进行采样
+# 第三步：将采样到的CDF值映射回坐标值
 def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
-    # Get pdf
+    # Get pdf 计算概率密度公式，论文公式5
     weights = weights + 1e-5 # prevent nans
     pdf = weights / torch.sum(weights, -1, keepdim=True)
     cdf = torch.cumsum(pdf, -1)
@@ -228,8 +233,8 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
         u = torch.Tensor(u)
 
     # Invert CDF
-    u = u.contiguous()
-    inds = torch.searchsorted(cdf, u, right=True)
+    u = u.contiguous()  # 把tensor编程内存连续分布形式
+    inds = torch.searchsorted(cdf, u, right=True)   # 用高维的searchsorted算子去寻找坐标值的索引
     below = torch.max(torch.zeros_like(inds-1), inds-1)
     above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
     inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)

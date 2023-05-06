@@ -39,6 +39,7 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+    # ******************* 5.2.1.1 位置编码 *******************
     embedded = embed_fn(inputs_flat)   
 
     if viewdirs is not None:
@@ -46,6 +47,7 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
         embedded = torch.cat([embedded, embedded_dirs], -1)
+    # ******************* 5.2.1.2 网络学习 *******************
     # 以更小的patch-netchunk送进网络跑前向，比如chunk=20，就1-20跑一波，21-40跑一波。。。
     outputs_flat = batchify(fn, netchunk)(embedded)
     # 将list重新拼接reshape为[1024,64,64] 4:rgb alpha
@@ -55,15 +57,17 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
 
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
+    在更小的batch上进行渲染,避免超出内存
     """
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
+        # ******************* 5.2 minibatch 渲染 *******************
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
             all_ret[k].append(ret[k])
-
+    # 将所有的结果拼接后一起返回
     all_ret = {k : torch.cat(all_ret[k], 0) for k in all_ret}
     return all_ret
 
@@ -105,37 +109,43 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
       acc_map: [batch_size]. Accumulated opacity (alpha) along a ray. 深度图
       extras: dict with everything returned by render_rays(). 其他
     """
+    # ******************* 5.0 数据准备 *******************
     if c2w is not None:
         # special case to render full image
+        # 如果c2w不为空，重新计算下全图的ray
         rays_o, rays_d = get_rays(H, W, K, c2w)
     else:
         # use provided ray batch
+        # 否则使用前面计算好的ray
         rays_o, rays_d = rays
 
     if use_viewdirs:
         # provide ray directions as input
-        viewdirs = rays_d
+        viewdirs = rays_d   # 视角就是光线的方向
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
+            # 特殊的情况下，会重新算下光线（用于做实验）
             rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-        viewdirs = torch.reshape(viewdirs, [-1,3]).float()
+        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)    #归一化得到单位向量
+        viewdirs = torch.reshape(viewdirs, [-1,3]).float()  #将方向矩阵shape调整为[n_batch,3] eg.[1024,3]
 
-    sh = rays_d.shape # [..., 3]
+    sh = rays_d.shape # [..., 3] eg.[1024,3]
     if ndc:
         # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
     # Create ray batch
-    rays_o = torch.reshape(rays_o, [-1,3]).float()
-    rays_d = torch.reshape(rays_d, [-1,3]).float()
+    # 构建batch
+    rays_o = torch.reshape(rays_o, [-1,3]).float() #光线起始点[1024,3]
+    rays_d = torch.reshape(rays_d, [-1,3]).float() #光线方向[1024,3]
 
-    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])   #光线的最近和最远深度均为[1024,1]和光线一样的个数
+    rays = torch.cat([rays_o, rays_d, near, far], -1)  # 将上面4个量拼接起来，就是[1024,8]
     if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
+        rays = torch.cat([rays, viewdirs], -1)# 再将上面归一化后得到的光线方向单位向量拼接进来,[1024,11]
 
     # Render and reshape
+    # ******************* 5.1 渲染 *******************
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
@@ -293,8 +303,9 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
+    # 见论文公式3中alpha公式定义
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-
+    # 同样论文公式3定义：delta_i = t_{i+1}-t_i
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
@@ -311,14 +322,14 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples] alpha值计算
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
-    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1] # 权重计算公式见论文公式3
+    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3] rgb值计算
 
-    depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
+    depth_map = torch.sum(weights * z_vals, -1) # 深度图计算d=\sum w_iz_i
+    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1)) # 视差图计算
+    acc_map = torch.sum(weights, -1)    # 权重求和
 
     if white_bkgd:
         rgb_map = rgb_map + (1.-acc_map[...,None])
@@ -339,57 +350,71 @@ def render_rays(ray_batch,
                 raw_noise_std=0.,
                 verbose=False,
                 pytest=False):
-    """Volumetric rendering.
+    """Volumetric rendering.体素渲染
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
-        for sampling along a ray, including: ray origin, ray direction, min
-        dist, max dist, and unit-magnitude viewing direction.
+        for sampling along a ray, including: ray origin原点, ray direction, min
+        dist, max dist, and unit-magnitude viewing direction单位方向.
+
       network_fn: function. Model for predicting RGB and density at each point
-        in space.
-      network_query_fn: function used for passing queries to network_fn.
-      N_samples: int. Number of different times to sample along each ray.
-      retraw: bool. If True, include model's raw, unprocessed predictions.
-      lindisp: bool. If True, sample linearly in inverse depth rather than in depth.
+        in space.NeRF网络,用来预测空间中每个点rgb和不透明度
+
+      network_query_fn: function used for passing queries查询 to network_fn.
+
+      N_samples: int. Number of different times to sample along each ray.粗糙采样点数
+
+      retraw: bool. If True, include model's raw, unprocessed predictions.真就返回无压缩数据
+
+      lindisp: bool. If True, sample linearly in inverse depth rather than in depth. 以反深度进行线性采样
+
       perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified
-        random points in time.
+        random points in time. 波动
+
       N_importance: int. Number of additional times to sample along each ray.
-        These samples are only passed to network_fine.
+        These samples are only passed to network_fine.精细网络增加的采样点数
+
       network_fine: "fine" network with same spec as network_fn.
+
       white_bkgd: bool. If True, assume a white background.
-      raw_noise_std: ...
+
+      raw_noise_std: ...噪声
+
       verbose: bool. If True, print more debugging info.
+
     Returns:
-      rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
-      disp_map: [num_rays]. Disparity map. 1 / depth.
-      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      raw: [num_rays, num_samples, 4]. Raw predictions from model.
+      rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model. ray的rgb值
+      disp_map: [num_rays]. Disparity map. 1 / depth.   视差
+      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.累积不透明度
+      raw: [num_rays, num_samples, 4]. Raw predictions from model. 原始raw数据
       rgb0: See rgb_map. Output for coarse model.
       disp0: See disp_map. Output for coarse model.
       acc0: See acc_map. Output for coarse model.
-      z_std: [num_rays]. Standard deviation of distances along ray for each
-        sample.
+      z_std: [num_rays]. Standard deviation of distances along ray for each sample.标准差
     """
+    # 下面是取各种数据出来
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
-    near, far = bounds[...,0], bounds[...,1] # [-1,1]
-
-    t_vals = torch.linspace(0., 1., steps=N_samples)
+    near, far = bounds[...,0], bounds[...,1] # [-1,1] 每个[N_rays,1]
+    # 粗糙网络采样
+    t_vals = torch.linspace(0., 1., steps=N_samples) # 在0-1之间线性采样N_samples个值
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
     else:
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
-    z_vals = z_vals.expand([N_rays, N_samples])
+    z_vals = z_vals.expand([N_rays, N_samples]) # 给N_rays曲线每条都在near-far之间取N_samples个采样 
 
+
+    # 加扰动
     if perturb > 0.:
         # get intervals between samples
-        mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-        upper = torch.cat([mids, z_vals[...,-1:]], -1)
-        lower = torch.cat([z_vals[...,:1], mids], -1)
+        mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])  # 均值[N_rays,N_samples-1]
+        upper = torch.cat([mids, z_vals[...,-1:]], -1)  # [N_rays,N_samples]
+        lower = torch.cat([z_vals[...,:1], mids], -1)   # [N_rays,N_samples]
         # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape)
+        t_rand = torch.rand(z_vals.shape)   # 在这些间隔点中分层采样点
 
         # Pytest, overwrite u with numpy's fixed random numbers
         if pytest:
@@ -398,29 +423,36 @@ def render_rays(ray_batch,
             t_rand = torch.Tensor(t_rand)
 
         z_vals = lower + (upper - lower) * t_rand
-
+    # 得到每个采样点的3D坐标:原点o+光线方向d*采样点深度
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
 #     raw = run_network(pts)
-    raw = network_query_fn(pts, viewdirs, network_fn)
+    # ******************* 5.2.1 coarse网络推断 *******************
+    # 送进粗糙网络进行预测
+    raw = network_query_fn(pts, viewdirs, network_fn)   #[ray_batch,N_samples,4]  eg.[1024,64,4]
+    # ******************* 5.2.2 coarse raw数据转换为rgb,视差，不透明度，权重和深度 *******************
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
+    # 精细网络采样
     if N_importance > 0:
-
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        
+        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map # 利用上面coarse网络计算的各个值
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        # ******************* 5.2.3 精细网络Pdf采样 *******************
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
         z_samples = z_samples.detach()
 
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
-
+        
         run_fn = network_fn if network_fine is None else network_fine
 #         raw = run_network(pts, fn=run_fn)
+        # ******************* 5.2.4 精细网络推断  *******************
+        # network_query_fn()定义于3.3
         raw = network_query_fn(pts, viewdirs, run_fn)
-
+        # ******************* 5.2.5 finw raw数据转换为rgb,视差，不透明度，权重和深度   *******************
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
@@ -792,28 +824,31 @@ def train():
                 batch_rays = torch.stack([rays_o, rays_d], 0)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
+
         #####  Core optimization loop  #####
-        # ******************* 5.渲染过程*******************
+        # ******************* 5. 渲染过程*******************
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
+        # ******************* 6. 计算loss *******************
+        img_loss = img2mse(rgb, target_s)   # 计算L2 loss
         trans = extras['raw'][...,-1]
         loss = img_loss
-        psnr = mse2psnr(img_loss)
+        psnr = mse2psnr(img_loss)   # j计算性能指标psnr
 
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
-        loss.backward()
-        optimizer.step()
+        loss.backward() # 反向传播
+        optimizer.step()# 更新参数
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
+        # 调整学习率
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1000
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
@@ -826,6 +861,7 @@ def train():
         #####           end            #####
 
         # Rest is logging
+        # 保存log
         if i%args.i_weights==0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             torch.save({
@@ -838,6 +874,7 @@ def train():
 
         if i%args.i_video==0 and i > 0:
             # Turn on testing mode
+            # 视屏渲染
             with torch.no_grad():
                 rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
