@@ -114,7 +114,8 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     
     def imread(f):
         if f.endswith('png'):
-            return imageio.imread(f, ignoregamma=True)
+            #return imageio.imread(f, ignoregamma=True) 原代码有gamma修正参数，但貌似最新版的imageio就自动带修正了，这个参数没了
+            return imageio.imread(f)
         else:
             return imageio.imread(f)
     
