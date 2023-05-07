@@ -79,7 +79,12 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     # 如果给定了下采样参数，就对图像进行下采样
     if factor is not None:
         sfx = '_{}'.format(factor)
-        _minify(basedir, factors=[factor])  # _minify()函数对图像进行采样，降低分辨率
+        """
+        _minify()函数就是实现降采样并存储图片到images_8目录下的功能,但是由于系统兼容性问题,windows和部分linux系统无法执行此函数中的部分系统指令,导致这个过程失败
+        如果失败就注释掉他,然后使用downsamples.py手动降采样,保存到images_8文件夹下
+
+        _minify(basedir, factors=[factor])  
+        """
         factor = factor
     elif height is not None:
         factor = sh[0] / float(height)
